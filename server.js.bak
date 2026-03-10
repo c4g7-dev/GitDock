@@ -1,0 +1,936 @@
+#!/usr/bin/env node
+// ╔══════════════════════════════════╗
+// ║   CLOUDVAULT  —  self-hosted     ║
+// ║   Git + File vault over HTTP/S   ║
+// ╚══════════════════════════════════╝
+
+const express   = require('express');
+const multer    = require('multer');
+const path      = require('node:path');
+const fs        = require('node:fs');
+const { execFileSync, spawn } = require('node:child_process');
+const AdmZip    = require('adm-zip');
+
+const app     = express();
+const PORT    = process.env.PORT    || 3000;
+const STORAGE = path.resolve(process.env.STORAGE_DIR || './storage');
+const REPOS   = path.join(STORAGE, 'repos');
+const FILES   = path.join(STORAGE, 'files');
+const TMP     = path.join(STORAGE, 'tmp');
+
+// ── bootstrap dirs ────────────────────────────────────────────────────────────
+[STORAGE, REPOS, FILES, TMP].forEach(d => fs.mkdirSync(d, { recursive: true }));
+
+const upload = multer({
+  dest: TMP,
+  limits: { fileSize: 500 * 1024 * 1024 },   // 500 MB
+});
+
+app.use(express.json());
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+function safeJoin(base, rel) {
+  const resolved = path.resolve(base, rel);
+  const norm = path.normalize(resolved);
+  const baseWithSep = base.endsWith(path.sep) ? base : base + path.sep;
+  if (norm !== base && !norm.startsWith(baseWithSep)) throw new Error('path traversal');
+  return norm;
+}
+
+function sanitizeFilename(name) {
+  return name.replace(/[/\\\0]/g, '_').replace(/^\.+/, '_');
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function fmtSize(b) {
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 ** 2) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 ** 3) return `${(b / 1024 ** 2).toFixed(1)} MB`;
+  return `${(b / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function dirSize(p) {
+  let total = 0;
+  try {
+    for (const f of fs.readdirSync(p)) {
+      const fp = path.join(p, f);
+      const s = fs.statSync(fp);
+      total += s.isDirectory() ? dirSize(fp) : s.size;
+    }
+  } catch {}
+  return total;
+}
+
+// ── frontend ──────────────────────────────────────────────────────────────────
+app.get('/', (_req, res) => res.setHeader('Content-Type', 'text/html').send(HTML));
+
+// ── API: repos ────────────────────────────────────────────────────────────────
+app.get('/api/repos', (_req, res) => {
+  const repos = fs.readdirSync(REPOS)
+    .filter(r => r.endsWith('.git'))
+    .map(r => {
+      const rp = path.join(REPOS, r);
+      let lastCommit = null;
+      try {
+        lastCommit = execFileSync('git', ['--git-dir', rp, 'log', '-1', '--format=%ar — %s'], { encoding: 'utf8' }).trim();
+      } catch {}
+      return { name: r, size: fmtSize(dirSize(rp)), lastCommit };
+    });
+  res.json(repos);
+});
+
+app.post('/api/repos', (req, res) => {
+  let { name } = req.body || {};
+  if (!name || !/^[\w.\-]+$/.test(name)) return res.status(400).json({ error: 'Invalid repo name' });
+  if (!name.endsWith('.git')) name += '.git';
+  const rp = path.join(REPOS, name);
+  if (fs.existsSync(rp)) return res.status(409).json({ error: 'Repo already exists' });
+  execFileSync('git', ['init', '--bare', rp]);
+  execFileSync('git', ['--git-dir', rp, 'config', 'http.receivepack', 'true']);
+  res.json({ name, cloneUrl: `http://HOST/git/${name}` });
+});
+
+app.delete('/api/repos/:name', (req, res) => {
+  try {
+    const rp = safeJoin(REPOS, req.params.name);
+    if (!fs.existsSync(rp)) return res.status(404).end();
+    fs.rmSync(rp, { recursive: true, force: true });
+    res.json({ ok: true });
+  } catch { res.status(400).end(); }
+});
+
+// ── API: files ────────────────────────────────────────────────────────────────
+app.get('/api/files', (_req, res) => {
+  const items = fs.readdirSync(FILES).map(f => {
+    const fp = path.join(FILES, f);
+    const s  = fs.statSync(fp);
+    return {
+      name:  f,
+      size:  fmtSize(s.isDirectory() ? dirSize(fp) : s.size),
+      isDir: s.isDirectory(),
+      mtime: s.mtime,
+    };
+  });
+  res.json(items);
+});
+
+app.post('/api/upload', upload.single('file'), (req, res) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'No file received' });
+
+  const origName = sanitizeFilename(Buffer.from(file.originalname, 'latin1').toString('utf8'));
+  const doExtract = req.body.extract === 'true';
+
+  try {
+    if (doExtract && origName.toLowerCase().endsWith('.zip')) {
+      const zip     = new AdmZip(file.path);
+      const dirName = path.basename(origName, '.zip');
+      const destDir = safeJoin(FILES, dirName);
+      // ZipSlip protection: validate all entry paths before extracting
+      for (const entry of zip.getEntries()) {
+        const entryTarget = path.resolve(destDir, entry.entryName);
+        if (!entryTarget.startsWith(destDir + path.sep) && entryTarget !== destDir) {
+          fs.unlinkSync(file.path);
+          return res.status(400).json({ error: 'Zip contains unsafe path: ' + entry.entryName });
+        }
+      }
+      zip.extractAllTo(destDir, true);
+      fs.unlinkSync(file.path);
+      res.json({ type: 'extracted', name: path.basename(destDir) });
+    } else {
+      const dest = safeJoin(FILES, origName);
+      fs.renameSync(file.path, dest);
+      res.json({ type: 'saved', name: origName });
+    }
+  } catch (err) {
+    try { fs.unlinkSync(file.path); } catch {}
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.delete('/api/files/:name', (req, res) => {
+  try {
+    const fp = safeJoin(FILES, req.params.name);
+    if (!fs.existsSync(fp)) return res.status(404).end();
+    fs.rmSync(fp, { recursive: true, force: true });
+    res.json({ ok: true });
+  } catch { res.status(400).end(); }
+});
+
+app.get('/api/files/:name/download', (req, res) => {
+  try {
+    const fp = safeJoin(FILES, req.params.name);
+    if (!fs.existsSync(fp)) return res.status(404).end();
+    if (fs.statSync(fp).isDirectory()) {
+      const zip = new AdmZip();
+      zip.addLocalFolder(fp);
+      const safeName = encodeURIComponent(req.params.name).replace(/%20/g, '+');
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${safeName}.zip`);
+      res.setHeader('Content-Type', 'application/zip');
+      res.send(zip.toBuffer());
+    } else {
+      res.download(fp);
+    }
+  } catch { res.status(400).end(); }
+});
+
+// ── Git smart HTTP backend ────────────────────────────────────────────────────
+// Clone:  git clone http://yourserver/git/myrepo.git
+// Push:   git remote add origin http://yourserver/git/myrepo.git && git push
+app.all('/git/{*path}', (req, res) => {
+  const pathInfo = req.path.replace(/^\/git/, '');
+
+  // Auto-create bare repo on first push/clone
+  const repoMatch = pathInfo.match(/^\/([\w.\-]+\.git)\//);
+  if (repoMatch) {
+    const rp = path.join(REPOS, repoMatch[1]);
+    if (!fs.existsSync(rp)) {
+      try {
+        execFileSync('git', ['init', '--bare', rp]);
+        execFileSync('git', ['--git-dir', rp, 'config', 'http.receivepack', 'true']);
+      } catch (e) {
+        return res.status(500).send('Could not initialise repo');
+      }
+    }
+  }
+
+  const qs = Object.entries(req.query).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+
+  const env = {
+    ...process.env,
+    GIT_PROJECT_ROOT:  REPOS,
+    GIT_HTTP_EXPORT_ALL: '1',
+    PATH_INFO:         pathInfo,
+    REMOTE_USER:       '',
+    REMOTE_ADDR:       req.ip || '',
+    CONTENT_TYPE:      req.headers['content-type'] || '',
+    QUERY_STRING:      qs,
+    REQUEST_METHOD:    req.method,
+    SERVER_PROTOCOL:   'HTTP/1.1',
+    HTTP_GIT_PROTOCOL: req.headers['git-protocol'] || '',
+  };
+
+  const git = spawn('git', ['http-backend'], { env });
+  req.pipe(git.stdin);
+
+  let raw = Buffer.alloc(0);
+  let headersDone = false;
+
+  git.stdout.on('data', chunk => {
+    if (headersDone) { res.write(chunk); return; }
+    raw = Buffer.concat([raw, chunk]);
+    const sep = raw.indexOf('\r\n\r\n');
+    if (sep === -1) return;
+
+    headersDone = true;
+    const headerBlock = raw.slice(0, sep).toString('utf8');
+    const body        = raw.slice(sep + 4);
+
+    let status = 200;
+    headerBlock.split('\r\n').forEach(line => {
+      const sm = line.match(/^Status:\s*(\d+)/i);
+      if (sm) { status = parseInt(sm[1]); return; }
+      const ci = line.indexOf(': ');
+      if (ci > 0) res.setHeader(line.slice(0, ci), line.slice(ci + 2));
+    });
+    res.status(status);
+    if (body.length) res.write(body);
+  });
+
+  git.stdout.on('end', () => res.end());
+  git.stderr.on('data', d => process.stderr.write('[git] ' + d));
+  git.on('error', err => { console.error('[spawn]', err); if (!res.headersSent) res.status(500).end(); });
+});
+
+// ── API: system info ──────────────────────────────────────────────────────────
+app.get('/api/info', (_req, res) => {
+  res.json({
+    repos:     fs.readdirSync(REPOS).filter(r => r.endsWith('.git')).length,
+    files:     fs.readdirSync(FILES).length,
+    storageMB: (dirSize(STORAGE) / 1024 / 1024).toFixed(1),
+    uptime:    Math.floor(process.uptime()),
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  AMOLED FRONTEND  —  pure black, neon teal accent
+// ═════════════════════════════════════════════════════════════════════════════
+const HTML = /* html */`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CloudVault</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Grotesk:wght@300;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:      #000000;
+    --bg1:     #080808;
+    --bg2:     #0f0f0f;
+    --bg3:     #161616;
+    --border:  #1c1c1c;
+    --border2: #282828;
+    --a:       #00e5a0;      /* teal-green main accent  */
+    --a2:      #0ea5e9;      /* sky blue for git        */
+    --a3:      #a855f7;      /* purple for special      */
+    --danger:  #ff3355;
+    --warn:    #f59e0b;
+    --txt:     #d4d4d4;
+    --txt2:    #666;
+    --txt3:    #333;
+    --mono:    'JetBrains Mono', monospace;
+    --sans:    'Space Grotesk', sans-serif;
+    --r:       6px;
+    --r2:      12px;
+    --glow:    0 0 20px rgba(0,229,160,.15);
+    --glowb:   0 0 20px rgba(14,165,233,.15);
+  }
+  *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+  html { scroll-behavior:smooth; }
+  body {
+    background: var(--bg);
+    color: var(--txt);
+    font-family: var(--sans);
+    font-size: 14px;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ── scrollbar ── */
+  ::-webkit-scrollbar { width:4px; height:4px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius:2px; }
+
+  /* ── topbar ── */
+  #topbar {
+    position:sticky; top:0; z-index:100;
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 0 20px;
+    height: 52px;
+    background: rgba(0,0,0,.92);
+    backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border);
+  }
+  .logo {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 4px;
+    color: var(--a);
+    text-transform: uppercase;
+    display:flex; align-items:center; gap:10px;
+  }
+  .logo-dot { width:7px;height:7px;border-radius:50%;background:var(--a);box-shadow:0 0 8px var(--a); animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.4;} }
+
+  .stats-bar {
+    display:flex; gap:20px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--txt2);
+  }
+  .stat-item { display:flex; align-items:center; gap:5px; }
+  .stat-val { color: var(--txt); }
+
+  /* ── layout ── */
+  .container { max-width:1100px; margin:0 auto; padding:24px 20px; }
+
+  /* ── section header ── */
+  .section-head {
+    display:flex; align-items:center; justify-content:space-between;
+    margin-bottom:14px;
+  }
+  .section-title {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--txt2);
+    display:flex; align-items:center; gap:8px;
+  }
+  .section-title::before {
+    content:'';
+    display:inline-block;
+    width:3px; height:12px;
+    border-radius:2px;
+  }
+  .section-title.git::before  { background:var(--a2); box-shadow:0 0 6px var(--a2); }
+  .section-title.files::before { background:var(--a);  box-shadow:0 0 6px var(--a); }
+
+  /* ── card grid ── */
+  .card-grid {
+    display:grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap:10px;
+    margin-bottom:32px;
+  }
+
+  /* ── card ── */
+  .card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: var(--r2);
+    padding: 14px 16px;
+    display:flex; flex-direction:column; gap:6px;
+    position:relative;
+    transition: border-color .2s, transform .15s;
+    overflow:hidden;
+  }
+  .card::after {
+    content:'';
+    position:absolute; top:0; left:0; right:0;
+    height:1px;
+    background: linear-gradient(90deg, transparent, var(--a2) 50%, transparent);
+    opacity:0;
+    transition: opacity .2s;
+  }
+  .card.file-card::after { background: linear-gradient(90deg, transparent, var(--a) 50%, transparent); }
+  .card:hover { border-color: var(--border2); transform:translateY(-1px); }
+  .card:hover::after { opacity:.6; }
+
+  .card-name {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight:500;
+    color: var(--txt);
+    white-space: nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .card-name .icon { color:var(--a2); margin-right:6px; }
+  .card.file-card .card-name .icon { color:var(--a); }
+  .card-meta {
+    font-family: var(--mono);
+    font-size:10px;
+    color: var(--txt2);
+    white-space: nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .card-actions {
+    display:flex; gap:6px; margin-top:4px;
+  }
+
+  /* ── buttons ── */
+  .btn {
+    display:inline-flex; align-items:center; gap:5px;
+    padding: 6px 12px;
+    font-family: var(--mono);
+    font-size:11px;
+    font-weight:500;
+    letter-spacing:.5px;
+    border-radius: var(--r);
+    border: 1px solid;
+    cursor:pointer;
+    transition: all .15s;
+    white-space:nowrap;
+    text-decoration:none;
+  }
+  .btn-ghost {
+    background:transparent;
+    border-color: var(--border2);
+    color: var(--txt2);
+  }
+  .btn-ghost:hover { border-color:var(--a2); color:var(--a2); box-shadow: var(--glowb); }
+  .btn-ghost.green:hover { border-color:var(--a); color:var(--a); box-shadow: var(--glow); }
+  .btn-danger { background:transparent; border-color:transparent; color:var(--txt3); }
+  .btn-danger:hover { border-color:var(--danger); color:var(--danger); }
+  .btn-primary {
+    background:var(--a);
+    border-color:var(--a);
+    color:#000;
+    font-weight:700;
+  }
+  .btn-primary:hover { background:#00ffb3; border-color:#00ffb3; box-shadow: var(--glow); }
+  .btn-blue {
+    background:var(--a2);
+    border-color:var(--a2);
+    color:#000;
+    font-weight:700;
+  }
+  .btn-blue:hover { background:#38bdf8; border-color:#38bdf8; box-shadow: var(--glowb); }
+  .btn-sm { padding:4px 9px; font-size:10px; }
+  .btn:disabled { opacity:.35; pointer-events:none; }
+
+  /* ── upload zone ── */
+  #drop-zone {
+    border: 2px dashed var(--border2);
+    border-radius: var(--r2);
+    padding: 36px 20px;
+    text-align:center;
+    cursor:pointer;
+    transition: all .2s;
+    background: var(--bg1);
+    margin-bottom:32px;
+    position:relative;
+  }
+  #drop-zone.drag-over {
+    border-color: var(--a);
+    background: rgba(0,229,160,.04);
+    box-shadow: 0 0 30px rgba(0,229,160,.1);
+  }
+  #drop-zone input[type=file] { position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%; }
+  .drop-icon {
+    font-size:32px;
+    margin-bottom:10px;
+    display:block;
+  }
+  .drop-title {
+    font-family: var(--mono);
+    font-size:13px;
+    color:var(--txt2);
+    margin-bottom:6px;
+  }
+  .drop-title span { color:var(--a); }
+  .drop-sub { font-size:11px; color:var(--txt3); font-family:var(--mono); }
+
+  /* ── upload options ── */
+  .upload-opts {
+    display:flex; align-items:center; justify-content:center; gap:16px;
+    margin-bottom:14px;
+    font-family:var(--mono); font-size:12px; color:var(--txt2);
+  }
+  .toggle { display:flex; align-items:center; gap:6px; cursor:pointer; }
+  .toggle input[type=checkbox] { accent-color:var(--a); width:14px; height:14px; }
+
+  /* ── progress ── */
+  .progress-wrap {
+    margin-bottom:32px;
+    display:none;
+  }
+  .progress-wrap.active { display:block; }
+  .progress-bar-outer {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius:20px;
+    height:6px;
+    overflow:hidden;
+    margin-bottom:8px;
+  }
+  .progress-bar-inner {
+    height:100%;
+    background: linear-gradient(90deg, var(--a2), var(--a));
+    border-radius:20px;
+    width:0%;
+    transition: width .3s;
+    box-shadow: 0 0 8px var(--a);
+  }
+  .progress-label {
+    font-family:var(--mono); font-size:11px; color:var(--txt2);
+    display:flex; justify-content:space-between;
+  }
+
+  /* ── toast ── */
+  #toast-wrap {
+    position:fixed; bottom:20px; right:20px;
+    display:flex; flex-direction:column; gap:8px;
+    z-index:999;
+  }
+  .toast {
+    background: var(--bg3);
+    border: 1px solid var(--border2);
+    border-radius:var(--r);
+    padding:10px 16px;
+    font-family:var(--mono);
+    font-size:12px;
+    max-width:320px;
+    animation: slideIn .2s ease;
+    border-left: 3px solid var(--a);
+  }
+  .toast.err { border-left-color: var(--danger); }
+  @keyframes slideIn {
+    from { transform:translateX(20px); opacity:0; }
+    to   { transform:translateX(0);    opacity:1; }
+  }
+
+  /* ── modal ── */
+  .modal-bg {
+    display:none;
+    position:fixed; inset:0; z-index:200;
+    background: rgba(0,0,0,.8);
+    backdrop-filter:blur(4px);
+    align-items:center; justify-content:center;
+  }
+  .modal-bg.open { display:flex; }
+  .modal {
+    background: var(--bg2);
+    border: 1px solid var(--border2);
+    border-radius: var(--r2);
+    padding: 24px;
+    width:100%;
+    max-width:420px;
+    box-shadow: 0 24px 60px rgba(0,0,0,.8);
+  }
+  .modal-title {
+    font-family:var(--mono); font-size:12px; letter-spacing:2px; text-transform:uppercase;
+    color:var(--a); margin-bottom:16px;
+  }
+  .input {
+    width:100%;
+    background: var(--bg3);
+    border: 1px solid var(--border2);
+    border-radius:var(--r);
+    padding: 10px 12px;
+    font-family:var(--mono);
+    font-size:13px;
+    color:var(--txt);
+    outline:none;
+    transition:border-color .15s;
+    margin-bottom:14px;
+  }
+  .input:focus { border-color:var(--a); box-shadow: 0 0 0 2px rgba(0,229,160,.1); }
+  .modal-actions { display:flex; gap:8px; justify-content:flex-end; }
+
+  /* ── copy box ── */
+  .copy-box {
+    background:var(--bg3);
+    border:1px solid var(--border);
+    border-radius:var(--r);
+    padding:8px 12px;
+    font-family:var(--mono); font-size:12px;
+    color:var(--a2);
+    cursor:pointer;
+    margin-bottom:10px;
+    transition: border-color .15s;
+    word-break:break-all;
+  }
+  .copy-box:hover { border-color:var(--a2); }
+
+  /* ── empty state ── */
+  .empty {
+    grid-column:1/-1;
+    text-align:center;
+    padding:32px;
+    font-family:var(--mono); font-size:12px; color:var(--txt3);
+  }
+
+  /* ── divider ── */
+  .divider { border:none; border-top:1px solid var(--border); margin: 28px 0; }
+
+  /* ── tag ── */
+  .tag {
+    display:inline-flex; align-items:center;
+    padding:2px 7px;
+    border-radius:4px;
+    font-family:var(--mono); font-size:10px;
+    background:var(--bg3); border:1px solid var(--border);
+    color:var(--txt2);
+  }
+  .tag.dir { border-color:rgba(0,229,160,.3); color:var(--a); }
+  .tag.zip { border-color:rgba(245,158,11,.3); color:var(--warn); }
+
+  /* ── git url info ── */
+  .git-hint {
+    background:var(--bg1);
+    border:1px solid var(--border);
+    border-left:3px solid var(--a2);
+    border-radius:var(--r);
+    padding:12px 14px;
+    font-family:var(--mono); font-size:11px;
+    color:var(--txt2);
+    margin-bottom:20px;
+    line-height:1.8;
+  }
+  .git-hint code { color:var(--a2); }
+  .git-hint b { color:var(--txt); }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="logo">
+    <div class="logo-dot"></div>
+    CLOUDVAULT
+  </div>
+  <div class="stats-bar">
+    <div class="stat-item">repos <span class="stat-val" id="s-repos">—</span></div>
+    <div class="stat-item">files <span class="stat-val" id="s-files">—</span></div>
+    <div class="stat-item">used <span class="stat-val" id="s-mb">—</span> MB</div>
+    <div class="stat-item">up <span class="stat-val" id="s-up">—</span>s</div>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- ── GIT REPOS ── -->
+  <div class="section-head">
+    <div class="section-title git">Git repositories</div>
+    <button class="btn btn-blue btn-sm" onclick="openNewRepo()">+ New repo</button>
+  </div>
+
+  <div class="git-hint" id="git-hint">
+    <b>Push to a new repo:</b>  <code>git remote add origin http://&lt;HOST&gt;/git/myrepo.git</code> → <code>git push -u origin main</code><br>
+    <b>Clone:</b>  <code>git clone http://&lt;HOST&gt;/git/myrepo.git</code><br>
+    Repos are auto-created on first push. Works on port 80 / 443.
+  </div>
+
+  <div class="card-grid" id="repo-grid">
+    <div class="empty">Loading…</div>
+  </div>
+
+  <hr class="divider">
+
+  <!-- ── FILE UPLOAD ── -->
+  <div class="section-head">
+    <div class="section-title files">File storage</div>
+  </div>
+
+  <div class="upload-opts">
+    <label class="toggle">
+      <input type="checkbox" id="opt-extract" checked>
+      Auto-extract ZIP
+    </label>
+  </div>
+
+  <div id="drop-zone">
+    <input type="file" id="file-input" multiple accept="*/*">
+    <span class="drop-icon">⬆</span>
+    <div class="drop-title">Drop files here or <span>click to browse</span></div>
+    <div class="drop-sub">ZIP / any file · max 500 MB</div>
+  </div>
+
+  <div class="progress-wrap" id="progress-wrap">
+    <div class="progress-bar-outer">
+      <div class="progress-bar-inner" id="progress-bar"></div>
+    </div>
+    <div class="progress-label">
+      <span id="prog-name">uploading…</span>
+      <span id="prog-pct">0%</span>
+    </div>
+  </div>
+
+  <div class="card-grid" id="file-grid">
+    <div class="empty">Loading…</div>
+  </div>
+
+</div>
+
+<!-- ── MODAL: new repo ── -->
+<div class="modal-bg" id="repo-modal">
+  <div class="modal">
+    <div class="modal-title">// New Repository</div>
+    <input class="input" id="repo-name-input" placeholder="my-project  (no spaces)" autocomplete="off" spellcheck="false">
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeNewRepo()">Cancel</button>
+      <button class="btn btn-blue" onclick="createRepo()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── MODAL: repo detail ── -->
+<div class="modal-bg" id="detail-modal">
+  <div class="modal">
+    <div class="modal-title" id="detail-title">// Repo</div>
+    <div class="copy-box" id="detail-clone" onclick="copyText(this)">http://HOST/git/…</div>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--txt3);margin-bottom:16px;">click URL to copy</div>
+    <div class="modal-actions">
+      <button class="btn btn-danger" id="detail-delete">Delete</button>
+      <button class="btn btn-ghost" onclick="closeDetail()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast-wrap"></div>
+
+<script>
+const HOST = location.origin;
+
+// ── utils ──────────────────────────────────────────────────────────────────
+function toast(msg, err=false) {
+  const t = document.createElement('div');
+  t.className = 'toast' + (err ? ' err' : '');
+  t.textContent = msg;
+  document.getElementById('toast-wrap').appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+async function api(url, opt={}) {
+  const r = await fetch(url, opt);
+  if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.error || r.statusText); }
+  return r.json();
+}
+
+function copyText(el) {
+  navigator.clipboard.writeText(el.textContent).then(() => toast('Copied!'));
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+
+// ── stats ──────────────────────────────────────────────────────────────────
+async function loadInfo() {
+  try {
+    const i = await api('/api/info');
+    document.getElementById('s-repos').textContent = i.repos;
+    document.getElementById('s-files').textContent = i.files;
+    document.getElementById('s-mb').textContent   = i.storageMB;
+    document.getElementById('s-up').textContent   = i.uptime;
+  } catch {}
+}
+setInterval(loadInfo, 10000);
+
+// ── repo list ──────────────────────────────────────────────────────────────
+async function loadRepos() {
+  const grid = document.getElementById('repo-grid');
+  try {
+    const repos = await api('/api/repos');
+    if (!repos.length) { grid.innerHTML = '<div class="empty">No repos yet — create one or just git push</div>'; return; }
+    grid.innerHTML = repos.map(r => \`
+      <div class="card" onclick="openDetail('\${esc(r.name)}')">
+        <div class="card-name"><span class="icon">⬡</span>\${esc(r.name)}</div>
+        <div class="card-meta">\${esc(r.lastCommit || 'empty repo')}</div>
+        <div class="card-meta" style="color:var(--txt3)">\${esc(r.size)}</div>
+      </div>
+    \`).join('');
+  } catch(e) { grid.innerHTML = '<div class="empty" style="color:var(--danger)">Error loading repos</div>'; }
+}
+
+// ── file list ──────────────────────────────────────────────────────────────
+async function loadFiles() {
+  const grid = document.getElementById('file-grid');
+  try {
+    const files = await api('/api/files');
+    if (!files.length) { grid.innerHTML = '<div class="empty">No files yet — upload something</div>'; return; }
+    grid.innerHTML = files.map(f => \`
+      <div class="card file-card">
+        <div class="card-name"><span class="icon">\${f.isDir ? '◫' : '◻'}</span>\${esc(f.name)}</div>
+        <div class="card-meta">\${esc(f.size)} · \${esc(new Date(f.mtime).toLocaleDateString())}</div>
+        <div class="card-actions">
+          <a class="btn btn-ghost green btn-sm" href="/api/files/\${encodeURIComponent(f.name)}/download">↓ Download</a>
+          <button class="btn btn-danger btn-sm" onclick="deleteFile(event,'\${esc(f.name)}')">✕</button>
+        </div>
+      </div>
+    \`).join('');
+  } catch(e) { grid.innerHTML = '<div class="empty" style="color:var(--danger)">Error loading files</div>'; }
+}
+
+// ── upload ─────────────────────────────────────────────────────────────────
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('drag-over');
+  uploadFiles([...e.dataTransfer.files]);
+});
+fileInput.addEventListener('change', () => { uploadFiles([...fileInput.files]); fileInput.value=''; });
+
+async function uploadFiles(files) {
+  for (const file of files) {
+    await uploadOne(file);
+  }
+  loadFiles(); loadInfo();
+}
+
+function uploadOne(file) {
+  return new Promise(resolve => {
+    const extract = document.getElementById('opt-extract').checked;
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('extract', extract);
+
+    const prog = document.getElementById('progress-wrap');
+    const bar  = document.getElementById('progress-bar');
+    const name = document.getElementById('prog-name');
+    const pct  = document.getElementById('prog-pct');
+
+    prog.classList.add('active');
+    name.textContent = file.name;
+    bar.style.width  = '0%';
+    pct.textContent  = '0%';
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload');
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable) {
+        const p = Math.round(e.loaded/e.total*100);
+        bar.style.width = p+'%';
+        pct.textContent = p+'%';
+      }
+    };
+    xhr.onload = () => {
+      prog.classList.remove('active');
+      if (xhr.status === 200) toast('✓ ' + file.name + ' uploaded');
+      else toast('Upload failed: ' + file.name, true);
+      resolve();
+    };
+    xhr.onerror = () => { prog.classList.remove('active'); toast('Network error', true); resolve(); };
+    xhr.send(fd);
+  });
+}
+
+// ── delete file ────────────────────────────────────────────────────────────
+async function deleteFile(e, name) {
+  e.stopPropagation();
+  if (!confirm('Delete "' + name + '"?')) return;
+  try {
+    await api('/api/files/' + encodeURIComponent(name), { method:'DELETE' });
+    toast('Deleted ' + name);
+    loadFiles(); loadInfo();
+  } catch(err) { toast('Delete failed: '+err.message, true); }
+}
+
+// ── new repo modal ─────────────────────────────────────────────────────────
+function openNewRepo() {
+  document.getElementById('repo-modal').classList.add('open');
+  document.getElementById('repo-name-input').focus();
+}
+function closeNewRepo() {
+  document.getElementById('repo-modal').classList.remove('open');
+  document.getElementById('repo-name-input').value = '';
+}
+async function createRepo() {
+  const name = document.getElementById('repo-name-input').value.trim();
+  if (!name) return;
+  try {
+    await api('/api/repos', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name}) });
+    toast('✓ Repo created: '+name+'.git');
+    closeNewRepo(); loadRepos(); loadInfo();
+  } catch(err) { toast('Error: '+err.message, true); }
+}
+document.getElementById('repo-name-input').addEventListener('keydown', e => { if(e.key==='Enter') createRepo(); if(e.key==='Escape') closeNewRepo(); });
+
+// ── repo detail modal ──────────────────────────────────────────────────────
+function openDetail(repoName) {
+  const url = HOST + '/git/' + repoName;
+  document.getElementById('detail-title').textContent = '// ' + repoName;
+  document.getElementById('detail-clone').textContent = url;
+  const del = document.getElementById('detail-delete');
+  del.onclick = () => deleteRepo(repoName);
+  document.getElementById('detail-modal').classList.add('open');
+}
+function closeDetail() { document.getElementById('detail-modal').classList.remove('open'); }
+async function deleteRepo(name) {
+  if (!confirm('Delete repo "'+name+'" and ALL its history?')) return;
+  try {
+    await api('/api/repos/'+encodeURIComponent(name), { method:'DELETE' });
+    toast('Deleted '+name);
+    closeDetail(); loadRepos(); loadInfo();
+  } catch(err) { toast('Error: '+err.message, true); }
+}
+
+// close modals on backdrop click
+['repo-modal','detail-modal'].forEach(id => {
+  document.getElementById(id).addEventListener('click', e => { if(e.target.id===id) e.target.classList.remove('open'); });
+});
+
+// ── init ──────────────────────────────────────────────────────────────────
+loadRepos(); loadFiles(); loadInfo();
+</script>
+</body>
+</html>`;
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n  ╔══════════════════════════════════╗`);
+  console.log(`  ║  CloudVault running on :${PORT}     ║`);
+  console.log(`  ║  Storage: ${STORAGE} ║`);
+  console.log(`  ╚══════════════════════════════════╝\n`);
+});
