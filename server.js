@@ -2028,7 +2028,7 @@ const HTML = /* html */`<!DOCTYPE html>
       <div class="profile-role">administrator</div>
       <div class="profile-sep"></div>
       <div class="profile-field">
-        <label>Display Name</label>
+        <label>Username</label>
         <input id="prof-name" type="text" autocomplete="off" placeholder="Your name">
       </div>
       <div class="profile-field">
@@ -3614,12 +3614,13 @@ function getAvatarUrl(emailHash, name) {
 function loadProfile() {
   api('/api/auth/me').then(function(u) {
     currentUser = u;
-    document.getElementById('user-pill-name').textContent = u.username;
-    document.getElementById('profile-username').textContent = u.username;
-    document.getElementById('prof-name').value = u.displayName || u.username;
+    var name = u.displayName || u.username;
+    document.getElementById('user-pill-name').textContent = name;
+    document.getElementById('profile-username').textContent = name;
+    document.getElementById('prof-name').value = name;
     document.getElementById('prof-email').value = u.email || '';
     document.getElementById('prof-token').value = u.gitToken || '';
-    var url = getAvatarUrl(u.emailHash, u.displayName || u.username);
+    var url = getAvatarUrl(u.emailHash, name);
     document.getElementById('user-avatar-img-sm').src = url;
     document.getElementById('user-avatar-img-lg').src = url;
   }).catch(function() {});
