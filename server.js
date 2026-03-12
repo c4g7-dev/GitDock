@@ -951,7 +951,7 @@ const HTML = /* html */`<!DOCTYPE html>
   /* ── topbar ── */
   #topbar {
     position:fixed; top:clamp(12px, 1vw, 22px); left:50%; transform:translateX(-50%); z-index:100;
-    display:flex; align-items:center; gap:clamp(14px, 1.1vw, 24px);
+    display:flex; align-items:center; gap:clamp(14px, 1.1vw, 24px); white-space:nowrap; flex-wrap:nowrap;
     padding: clamp(8px, .6vw, 14px) clamp(20px, 1.6vw, 36px);
     background: rgba(0,0,0,.92);
     backdrop-filter: blur(20px);
@@ -1057,10 +1057,10 @@ const HTML = /* html */`<!DOCTYPE html>
     font-size: clamp(11px, 0.78rem, 15px);
     color: var(--txt3);
   }
-  .stat-item { display:inline-flex; align-items:center; gap:6px; }
+  .stat-item { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; flex-shrink:0; }
   .stat-label { color: var(--txt3); }
-  .stat-val { color: var(--txt2); font-weight:500; font-variant-numeric: tabular-nums; }
-  .stat-sep { color: var(--border2); margin: 0 2px; }
+  .stat-val { color: var(--txt2); font-weight:500; font-variant-numeric: tabular-nums; white-space:nowrap; }
+  .stat-sep { color: var(--border2); margin: 0 2px; flex-shrink:0; }
   #s-up { display:inline-block; min-width: 4.5em; text-align:right; }
 
   /* ── topbar help btn ── */

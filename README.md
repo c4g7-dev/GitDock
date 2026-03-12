@@ -9,6 +9,20 @@
 
 GitDock is a lightweight, self-hosted Git server and file upload vault packed into a single `server.js` file. It features a modern AMOLED-black dashboard with smooth animations, commit history browsing, branch management, and session-based authentication — all without any build step or external database.
 
+## Screenshots
+
+| Login | Dashboard |
+|:---:|:---:|
+| ![Login](screenshots/login.png) | ![Dashboard](screenshots/dashboard.png) |
+
+| File Browser | File Viewer |
+|:---:|:---:|
+| ![Files](screenshots/repo-files.png) | ![Viewer](screenshots/file-viewer.png) |
+
+| Commit History |
+|:---:|
+| ![Commits](screenshots/commits.png) |
+
 ## Features
 
 - **Git hosting** — Push/pull repos over HTTP with Basic auth
@@ -95,10 +109,14 @@ systemctl daemon-reload
 systemctl enable --now gitdock
 ```
 
-### Reverse Proxy (Nginx)
+### Reverse Proxy
 
-Point your reverse proxy at `http://127.0.0.1:3099`:
+Point your reverse proxy at `http://127.0.0.1:3099`.
 
+<details>
+<summary><b>Nginx</b></summary>
+
+**HTTP only:**
 ```nginx
 server {
     listen 80;
@@ -115,6 +133,109 @@ server {
     }
 }
 ```
+
+**With HTTPS (Let's Encrypt):**
+```nginx
+server {
+    listen 80;
+    server_name git.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name git.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/git.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/git.example.com/privkey.pem;
+
+    client_max_body_size 100M;
+
+    location / {
+        proxy_pass http://127.0.0.1:3099;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+</details>
+
+<details>
+<summary><b>Traefik</b></summary>
+
+**Docker labels (HTTP):**
+```yaml
+labels:
+  - "traefik.enable=true"
+  - "traefik.http.routers.gitdock.rule=Host(`git.example.com`)"
+  - "traefik.http.routers.gitdock.entrypoints=web"
+  - "traefik.http.services.gitdock.loadbalancer.server.port=3099"
+```
+
+**Docker labels (HTTPS with automatic Let's Encrypt):**
+```yaml
+labels:
+  - "traefik.enable=true"
+  - "traefik.http.routers.gitdock.rule=Host(`git.example.com`)"
+  - "traefik.http.routers.gitdock.entrypoints=websecure"
+  - "traefik.http.routers.gitdock.tls.certresolver=letsencrypt"
+  - "traefik.http.services.gitdock.loadbalancer.server.port=3099"
+```
+
+**File provider (`gitdock.yml`):**
+```yaml
+http:
+  routers:
+    gitdock:
+      rule: "Host(`git.example.com`)"
+      service: gitdock
+      entryPoints:
+        - websecure
+      tls:
+        certResolver: letsencrypt
+  services:
+    gitdock:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:3099"
+```
+</details>
+
+<details>
+<summary><b>HAProxy</b></summary>
+
+**HTTP only:**
+```haproxy
+frontend http_front
+    bind *:80
+    acl is_gitdock hdr(host) -i git.example.com
+    use_backend gitdock_back if is_gitdock
+
+backend gitdock_back
+    server gitdock 127.0.0.1:3099 check
+    http-request set-header X-Real-IP %[src]
+    http-request set-header X-Forwarded-Proto http
+```
+
+**With HTTPS (SSL termination):**
+```haproxy
+frontend https_front
+    bind *:443 ssl crt /etc/haproxy/certs/git.example.com.pem
+    acl is_gitdock hdr(host) -i git.example.com
+    use_backend gitdock_back if is_gitdock
+
+frontend http_front
+    bind *:80
+    redirect scheme https code 301
+
+backend gitdock_back
+    server gitdock 127.0.0.1:3099 check
+    http-request set-header X-Real-IP %[src]
+    http-request set-header X-Forwarded-Proto https
+```
+</details>
 
 ## License
 
