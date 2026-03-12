@@ -57,6 +57,65 @@ storage/
   users.json    — User credentials (auto-created)
 ```
 
+## Deployment
+
+### Systemd (Linux server)
+
+```bash
+# Copy files to server
+scp server.js package.json root@YOUR_SERVER:/opt/gitdock/
+ssh root@YOUR_SERVER
+
+# Install dependencies
+cd /opt/gitdock
+mkdir -p storage/{repos,files,tmp}
+npm install --omit=dev
+
+# Create systemd service
+cat > /etc/systemd/system/gitdock.service << 'EOF'
+[Unit]
+Description=GitDock - Self-hosted Git + File Vault
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/gitdock
+ExecStart=/usr/bin/node /opt/gitdock/server.js
+Restart=always
+RestartSec=5
+Environment=PORT=3099
+Environment=STORAGE_DIR=/opt/gitdock/storage
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now gitdock
+```
+
+### Reverse Proxy (Nginx)
+
+Point your reverse proxy at `http://127.0.0.1:3099`:
+
+```nginx
+server {
+    listen 80;
+    server_name git.example.com;
+
+    client_max_body_size 100M;
+
+    location / {
+        proxy_pass http://127.0.0.1:3099;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
 ## License
 
 MIT
