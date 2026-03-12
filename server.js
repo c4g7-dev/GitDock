@@ -46,7 +46,7 @@ function verifyPassword(pw, stored) {
 (function initUsers() {
   const users = loadUsers();
   if (Object.keys(users).length === 0) {
-    users['admin'] = { hash: hashPassword('admin'), displayName: 'Admin', createdAt: Date.now() };
+    users['admin'] = { hash: hashPassword('admin'), displayName: 'admin', createdAt: Date.now() };
     saveUsers(users);
   }
   // ensure all users have a git token
@@ -3614,7 +3614,7 @@ function getAvatarUrl(emailHash, name) {
 function loadProfile() {
   api('/api/auth/me').then(function(u) {
     currentUser = u;
-    var name = u.displayName || u.username;
+    var name = u.username;
     document.getElementById('user-pill-name').textContent = name;
     document.getElementById('profile-username').textContent = name;
     document.getElementById('prof-name').value = name;
