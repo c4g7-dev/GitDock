@@ -3614,13 +3614,12 @@ function getAvatarUrl(emailHash, name) {
 function loadProfile() {
   api('/api/auth/me').then(function(u) {
     currentUser = u;
-    var name = u.username;
-    document.getElementById('user-pill-name').textContent = name;
-    document.getElementById('profile-username').textContent = name;
-    document.getElementById('prof-name').value = name;
+    document.getElementById('user-pill-name').textContent = u.username;
+    document.getElementById('profile-username').textContent = u.username;
+    document.getElementById('prof-name').value = u.displayName || u.username;
     document.getElementById('prof-email').value = u.email || '';
     document.getElementById('prof-token').value = u.gitToken || '';
-    var url = getAvatarUrl(u.emailHash, name);
+    var url = getAvatarUrl(u.emailHash, u.displayName || u.username);
     document.getElementById('user-avatar-img-sm').src = url;
     document.getElementById('user-avatar-img-lg').src = url;
   }).catch(function() {});
@@ -3683,6 +3682,7 @@ function saveProfile() {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify(profileBody)
       }).then(function(r) { return r.json(); })
+        .then(function(d) { currentUser.displayName = displayName; })
     );
   }
 
