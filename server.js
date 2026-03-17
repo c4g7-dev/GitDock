@@ -139,6 +139,12 @@ function dirSize(p) {
   return total;
 }
 
+// ── favicon ───────────────────────────────────────────────────────────────────
+const FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#00e5a0" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>`;
+app.get('/favicon.ico', (req, res) => {
+  res.setHeader('Content-Type', 'image/svg+xml').setHeader('Cache-Control', 'public, max-age=86400').send(FAVICON);
+});
+
 // ── login page ────────────────────────────────────────────────────────────────
 app.get('/login', (req, res) => {
   const session = getSession(req.cookies.session);
@@ -783,6 +789,7 @@ const LOGIN_HTML = /* html */`<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GitDock</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
 <style>
@@ -907,6 +914,7 @@ const HTML = /* html */`<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GitDock</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Grotesk:wght@300;500;700&display=swap" rel="stylesheet">
 <style>
