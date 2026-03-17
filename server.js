@@ -274,7 +274,7 @@ app.get('/api/repos/:name/branches', (req, res) => {
 });
 
 // ── API: commit log ──────────────────────────────────────────────────────────
-app.get('/api/repos/:name/log', (req, res) => {
+app.get('/api/repos/:name/commits', (req, res) => {
   try {
     const rp = safeJoin(REPOS, req.params.name);
     if (!fs.existsSync(rp)) return res.status(404).json({ error: 'Repo not found' });
@@ -2938,7 +2938,7 @@ function loadCommits(branch, append) {
     commitSkip = 0;
     expandedCommits = {};
   }
-  var url = '/api/repos/' + encodeURIComponent(currentRepo) + '/log?ref=' + encodeURIComponent(commitBranch) + '&limit=30&skip=' + commitSkip;
+  var url = '/api/repos/' + encodeURIComponent(currentRepo) + '/commits?ref=' + encodeURIComponent(commitBranch) + '&limit=30&skip=' + commitSkip;
   var list = document.getElementById('commit-list');
   if (!append) list.innerHTML = '<div class="loading">Loading\u2026</div>';
 
